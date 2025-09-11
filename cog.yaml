@@ -1,0 +1,13 @@
+# Configuration for Cog ⚙️
+# Reference: https://github.com/replicate/cog/blob/main/docs/yaml.md
+
+build:
+  gpu: false
+  python_version: "3.11"
+  python_packages:
+    - "requests==2.32.3"
+
+# Optional at runtime:
+#  - FIRECRAWL_BASE (defaults to http://5.188.178.213:3002)
+
+predict: "predict.py:Predictor"
