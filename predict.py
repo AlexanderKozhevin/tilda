@@ -31,6 +31,7 @@ SCHEMA = json.dumps({
     "content_categories": {
       "type": "object",
       "properties": {
+        # existing
         "porn_erotica": {"type": "boolean"},
         "sexual_services": {"type": "boolean"},
         "drugs": {"type": "boolean"},
@@ -40,12 +41,34 @@ SCHEMA = json.dumps({
         "phishing": {"type": "boolean"},
         "government_services_impersonation": {"type": "boolean"},
         "redirect_buttons": {"type": "boolean"},
-        "financial_scam_payouts": {"type": "boolean"}
+        "financial_scam_payouts": {"type": "boolean"},
+        # NEW: extra categories mapped to your examples
+        "profanity": {"type": "boolean"},                 # NEW
+        "account_sales": {"type": "boolean"},             # NEW
+        "explicit_nudity": {"type": "boolean"},           # NEW
+        "adult_no_age_gate": {"type": "boolean"},         # NEW
+        "erotic_spa_massage": {"type": "boolean"},        # NEW
+        "webcam_onlyfans": {"type": "boolean"},           # NEW
+        "poker_betting": {"type": "boolean"},             # NEW
+        "casino_affiliate": {"type": "boolean"},          # NEW
+        "alcohol_delivery": {"type": "boolean"},          # NEW
+        "nicotine_vapes": {"type": "boolean"},            # NEW
+        "hookah_tobacco": {"type": "boolean"},            # NEW
+        "nitrous_oxide": {"type": "boolean"},             # NEW
+        "amanita_mushrooms": {"type": "boolean"},         # NEW
+        "cannabis_cbd": {"type": "boolean"},              # NEW
+        "redirect_minimal_site": {"type": "boolean"}      # NEW
       },
       "required": [
+        # existing required
         "porn_erotica","sexual_services","drugs","extremism","casino_gambling",
         "weapons","phishing","government_services_impersonation","redirect_buttons",
-        "financial_scam_payouts"
+        "financial_scam_payouts",
+        # NEW required
+        "profanity","account_sales","explicit_nudity","adult_no_age_gate",
+        "erotic_spa_massage","webcam_onlyfans","poker_betting","casino_affiliate",
+        "alcohol_delivery","nicotine_vapes","hookah_tobacco","nitrous_oxide",
+        "amanita_mushrooms","cannabis_cbd","redirect_minimal_site"
       ],
       "additionalProperties": False
     },
@@ -97,30 +120,57 @@ Rules (very strict):
    - "domain": the primary domain you can infer from links/markdown context; if unknown, use an empty string "".
    - "is_tilda": true if the domain looks like a Tilda host (e.g., ends with ".tilda.ws" or similar Tilda patterns); else false.
 5) Category definitions ("content_categories"):
-   - porn_erotica: porn/erotica/nudity meant for arousal (not the same as prostitution ads).
-   - sexual_services: prostitution/paid sexual services/escorts/sex work ads.
-   - drugs: illegal/controlled recreational drugs (incl. mushrooms) or paraphernalia sales/promo.
-   - extremism: extremist symbols, propaganda, recruiting, praise of violent orgs/acts.
-   - casino_gambling: casinos, betting, lotteries with real-money stakes or promos (incl. recognizable betting/casino logos).
-   - weapons: sale/promo of firearms, ammunition, combat knives, or instructions to traffic these.
-   - phishing: credential/payment capture, fake logins/2FA, seed phrases, wallet drains, brand or government impersonation forms.
-   - government_services_impersonation: pages imitating official government portals/services to collect data or payments.
-   - redirect_buttons: UI that disguises redirects (e.g., deceptive "Download/Play/Continue" that lead elsewhere).
-   - financial_scam_payouts: promises of instant payouts/benefits with upfront fees, "get rich quick", pyramid-like pitches.
+   Base set:
+   - porn_erotica: порнография/эротика/намеренное возбуждение (не путать с проституцией).
+   - sexual_services: проституция/эскорт/платные сексуальные услуги.
+   - drugs: продажа/промо нелегальных рекреационных веществ (вкл. грибы) и атрибутики.
+   - extremism: экстремистская символика/пропаганда/вербовка/одобрение насилия.
+   - casino_gambling: казино/букмекеры/лотереи/ставки за деньги, их промо.
+   - weapons: оружие/боеприпасы/боевые ножи/инструкции по обороту.
+   - phishing: кража учётных данных/платежей, фальшивые логины/2FA/seed/wallet drains, подмена брендов/госуслуг.
+   - government_services_impersonation: имитация гос.порталов/сервисов ради сбора данных/платежей.
+   - redirect_buttons: обманные кнопки ("Скачать/Продолжить/Play") ведущие на сторонние сайты.
+   - financial_scam_payouts: мгновенные выплаты/доходы за взнос, "быстро разбогатей", пирамиды.
+
+   Extra set (new):
+   - profanity: ненормативная лексика.
+   - account_sales: продажа аккаунтов (соцсети/сервисы/игры и т.п.).
+   - explicit_nudity: откровенные изображения/обнажённые части тела.
+   - adult_no_age_gate: явный 18+ контент без возрастного ограничения/предупреждения.
+   - erotic_spa_massage: эротический спа/массаж/шибари и пр., без явной проституции.
+   - webcam_onlyfans: вебкам/OnlyFans/секс по видеосвязи.
+   - poker_betting: покерные клубы/обучение покеру/ставки/букмекеры (может сосуществовать с casino_gambling).
+   - casino_affiliate: партнёрские программы казино/промо-лендинги.
+   - alcohol_delivery: доставка алкоголя/спирта.
+   - nicotine_vapes: одноразовые вейпы/доставка никотиносодержащей продукции (IQOS и пр.).
+   - hookah_tobacco: табак/кальян/кальянный кейтеринг.
+   - nitrous_oxide: закись азота.
+   - amanita_mushrooms: мухоморы/amanita.
+   - cannabis_cbd: каннабис/КБД/конопля.
+   - redirect_minimal_site: минималистичный «хаб-редирект»: очень мало текста/контента, 1–5 кнопок/ссылок, ведущих на внешние сайты; часто Tilda-поддомены.
+
    Set each boolean strictly from the markdown evidence (true if present/promoted; otherwise false).
-6) Fraud rubric:
-   - "is_fraud": true if the page aims to deceive or steal (e.g., phishing, impersonation, payout scams). False otherwise.
+
+6) Heuristics & exceptions:
+   - profanity/explicit_nudity/adult_no_age_gate/erotic_spa_massage/webcam_onlyfans by themselves usually DO NOT imply "is_fraud" unless there is deception or illegal payment capture.
+   - account_sales, nicotine_vapes, hookah_tobacco, nitrous_oxide, amanita_mushrooms, cannabis_cbd: mark categories if offered; fraud only if there are deceptive claims or illegal payment traps.
+   - poker_betting/casino_affiliate: set alongside casino_gambling when appropriate.
+   - redirect_minimal_site: if page is extremely short, mostly buttons/anchors, and many external links, set redirect_minimal_site=true and (if buttons are deceptive) redirect_buttons=true. This increases risk_score but does not automatically force is_fraud=true without deceptive patterns.
+   - government/brand impersonation → phishing or government_services_impersonation and likely is_fraud=true.
+
+7) Fraud rubric:
+   - "is_fraud": true if the page aims to deceive or steal (e.g., phishing, impersonation, wallet drains, payout scams, deceptive redirects).
    - "risk_score":
        ≥0.90 clear fraud/phishing/impersonation with capture forms, seed/wallet requests, or multiple severe violations.
-       0.70–0.89 strong evidence of violations (e.g., explicit drug sales, prostitution ads, extremist propaganda, weapons trade, casino with payment funnels), or multiple red flags.
-       0.40–0.69 partial/indirect evidence, suggestive language, or weak signals.
+       0.70–0.89 strong evidence (explicit drug sales, prostitution ads, extremist propaganda, weapons trade, casino funnels, deceptive redirect hubs), or multiple red flags.
+       0.40–0.69 partial/indirect evidence, suggestive language, weak signals, or minimalistic redirect hubs without explicit deception.
        <0.40 likely informational or benign.
-7) "verdict": one concise sentence (<=220 chars) explaining the top reason(s) for the score, naming categories (and brand/government names if applicable).
-8) "evidence": 1–6 short quotes/snippets from the markdown that justify the decision (remove PII; keep quotes short).
-9) "impersonated_brands": brand/org names being mimicked (banks, wallets, gov portals), if any; else [].
-10) "keywords": 3–12 topical keywords (no hashtags), in the original language; avoid duplicates.
-11) "summary": <=400 chars, in the original language, neutral tone.
-12) Be conservative: if signals are weak, lower the score and set unrelated categories to false.
+8) "verdict": one concise sentence (<=220 chars) explaining the top reason(s) for the score, naming categories (and brand/government names if applicable).
+9) "evidence": 1–6 short quotes/snippets from the markdown that justify the decision (remove PII; keep quotes short).
+10) "impersonated_brands": brand/org names being mimicked (banks, wallets, gov portals), if any; else [].
+11) "keywords": 3–12 topical keywords (no hashtags), in the original language; avoid duplicates.
+12) "summary": <=400 chars, in the original language, neutral tone.
+13) Be conservative: if signals are weak, lower the score and set unrelated categories to false.
 
 Schema: {SCHEMA}
 
