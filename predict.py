@@ -326,4 +326,187 @@ def _keyword_category_scan(md: str, base_domain: str) -> t.Dict[str, bool]:
 
         # redirect_buttons: only if the link goes external AND text looks like a generic CTA
         button_like = any_re([
-            r"\bскачать\b", r"\bdow
+            r"\bскачать\b", r"\bdownload\b", r"\bplay\b", r"\bstart\b", r"\bcontinue\b", r"\bпродолжить\b",
+            r"\bперейти\b", r"\bgo\b", r"\bclaim\b", r"\bget\b", r"\bполучить\b", r"\bjoin\b",
+            r"\bsign\s*in\b", r"\bвойти\b", r"\blogin\b", r"\bлогин\b", r"\bрегист\w+", r"\binstall\b",
+            r"\bopen\s+app\b", r"\bbonus\b", r"\bfree\b"
+        ], hay=label.lower())
+        goes_external = not href_l or href_l.startswith(("tel:", "mailto:")) or \
+                        any(s in href_l for s in ("wa.me/", "t.me/", "telegram", "vk.com/", "ok.ru/",
+                                                  "instagram.com/", "facebook.com/", "youtube.com/", "youtu.be/",
+                                                  "whatsapp.com/")) or \
+                        (href_l.startswith("http") and _url_domain(href_l) and base and not _is_same_or_subdomain(_url_domain(href_l), base))
+        if button_like and goes_external:
+            flags["redirect_buttons"] = True
+
+    # Word count (rough)
+    words = len(re.findall(r"[A-Za-zА-Яа-я0-9]{3,}", lower))
+
+    total_links = external + internal
+    ext_share = (external / total_links) if total_links > 0 else 0.0
+
+    # "Minimal redirect hub" definition you described:
+    # - very little text (<= 200–250 words),
+    # - few external buttons (1..6),
+    # - mostly external links (>= 70% external),
+    # - and almost no real internal nav/content structure.
+    if words <= 220 and 1 <= external <= 6 and ext_share >= 0.7:
+        flags["redirect_minimal_site"] = True
+
+    return flags
+
+def _force_fraud_if_any_category_true(result: t.Dict[str, t.Any]) -> t.Dict[str, t.Any]:
+    """
+    If ANY boolean in content_categories == True -> enforce is_fraud = True.
+    (Left as-is per your policy.)
+    """
+    try:
+        cc = result.get("content_categories", {}) or {}
+        if isinstance(cc, dict) and any(bool(v) for v in cc.values()):
+            result["is_fraud"] = True
+        return result
+    except Exception:
+        return result
+
+def _replicate_create_prediction(prompt: str) -> str:
+    """Create prediction on Replicate; return prediction id."""
+    url = f"{REPLICATE_API}/models/{REPLICATE_MODEL}/predictions"
+    headers = {
+        "Authorization": f"Bearer {REPLICATE_TOKEN}",
+        "Content-Type": "application/json",
+    }
+    body = {
+        "input": {
+            "top_p": 1,
+            "prompt": prompt,
+            "max_tokens": 16000,
+            "temperature": 0.1,
+            "presence_penalty": 0,
+            "frequency_penalty": 0,
+        }
+    }
+
+    resp = requests.post(url, headers=headers, json=body, timeout=60)
+
+    # Fallback if path form is unsupported in environment (use version param style)
+    if resp.status_code == 404:
+        url = f"{REPLICATE_API}/predictions"
+        body = {"version": REPLICATE_MODEL, "input": body["input"]}
+        resp = requests.post(url, headers=headers, json=body, timeout=60)
+
+    resp.raise_for_status()
+    data = resp.json()
+    prediction_id = data.get("id")
+    if not prediction_id:
+        raise RuntimeError("No prediction ID from Replicate API")
+    return prediction_id
+
+def _replicate_poll_prediction(prediction_id: str) -> t.Any:
+    """Poll until succeeded/failed or timeout; return parsed JSON output."""
+    headers = {
+        "Authorization": f"Bearer {REPLICATE_TOKEN}",
+        "Content-Type": "application/json",
+    }
+    start = time.time()
+    timeout_sec = REPLICATE_TIMEOUT_MS / 1000.0
+
+    while (time.time() - start) < timeout_sec:
+        url = f"{REPLICATE_API}/predictions/{prediction_id}"
+        r = requests.get(url, headers=headers, timeout=30)
+        r.raise_for_status()
+        data = r.json()
+        status = data.get("status")
+
+        if status == "succeeded":
+            output = data.get("output")
+            # Replicate LLMs sometimes return array of strings → join
+            if isinstance(output, list):
+                output = "".join([s for s in output if isinstance(s, str) and s.strip()])
+            if isinstance(output, str):
+                try:
+                    return json.loads(output)
+                except Exception as e:
+                    raise RuntimeError(f"Invalid JSON in Replicate output: {e}") from e
+            elif isinstance(output, dict):
+                return output
+            else:
+                raise RuntimeError("Unexpected Replicate output type")
+        elif status in ("failed", "canceled"):
+            err = data.get("error") or "Unknown error"
+            raise RuntimeError(f"Replicate prediction {status}: {err}")
+
+        time.sleep(REPLICATE_POLL_INTERVAL_SEC)
+
+    raise TimeoutError("Timeout waiting for Replicate prediction to complete")
+
+class Predictor(BasePredictor):
+    def setup(self) -> None:
+        """No heavy model to preload."""
+        pass
+
+    def predict(
+        self,
+        url: str = Input(description="Public URL to classify (HTML page to be scraped via Firecrawl)"),
+    ) -> t.Dict[str, t.Any]:
+        """
+        Firecrawl -> markdown, Replicate classify (create + poll), parse JSON, return.
+
+        Returns:
+          {
+            "success": true/false,
+            "url": "<url>",
+            "result": <json object>  # on success
+            "error": "<message>"     # on failure
+          }
+        """
+        try:
+            scraped = _scrape_markdown(url)
+            print(scraped)
+            if not scraped.markdown:
+                return {"success": False, "url": url, "error": "No markdown from Firecrawl"}
+
+            # base domain for external/internal checks
+            base_domain = _extract_domain(url)
+
+            # keyword hints from raw markdown (anchors/menus included)
+            hints = _keyword_category_scan(scraped.markdown, base_domain)
+            hint_tokens = [k for k, v in hints.items() if v]
+
+            # feed hints into prompt explicitly to steer LLM
+            prompt = (
+                f"{PROMPT_HEADER}\n\n"
+                f"Signals (pre-detected category flags): {json.dumps(hint_tokens, ensure_ascii=False)}\n\n"
+                f"Page markdown:\n\n{scraped.markdown}"
+            )
+
+            prediction_id = _replicate_create_prediction(prompt)
+            parsed_json = _replicate_poll_prediction(prediction_id)
+
+            # Merge keyword flags (OR-logic with model output), but ensure all keys exist
+            try:
+                cc = parsed_json.get("content_categories") or {}
+                for key in [
+                    "porn_erotica","adult_services","drugs","tobacco_nicotine","casino_gambling",
+                    "weapons","phishing","government_services_impersonation","redirect_minimal_site",
+                    "redirect_buttons","financial_scam_payouts","account_sales","profanity","alcohol"
+                ]:
+                    cc[key] = bool(cc.get(key, False) or hints.get(key, False))
+                parsed_json["content_categories"] = cc
+            except Exception:
+                pass
+
+            # Enforce is_fraud = True if ANY category is True (per your policy)
+            parsed_json = _force_fraud_if_any_category_true(parsed_json)
+
+            # Light debug
+            try:
+                print(f"[RESULT] is_fraud={parsed_json.get('is_fraud')} "
+                      f"risk={parsed_json.get('risk_score')} "
+                      f"lang={parsed_json.get('language')}")
+            except Exception:
+                pass
+
+            return {"success": True, "url": url, "result": parsed_json}
+
+        except Exception as e:
+            return {"success": False, "url": url, "error": str(e)}
