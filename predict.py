@@ -8,6 +8,7 @@ import typing as t
 import requests
 import re
 from dataclasses import dataclass
+from urllib.parse import urlparse
 
 from cog import BasePredictor, Input
 
@@ -171,15 +172,34 @@ def _scrape_markdown(url: str) -> ScrapeResult:
 
     return ScrapeResult(markdown=md, length=len(md))
 
-def _keyword_category_scan(md: str) -> t.Dict[str, bool]:
+# --- domain utils -------------------------------------------------------------
+
+def _extract_domain(url: str) -> str:
+    """Return IDNA/ascii netloc domain from URL, without port/userinfo."""
+    try:
+        netloc = urlparse(url).netloc
+        host = netloc.split('@')[-1].split(':')[0].lower()
+        return host.encode("idna").decode("ascii")
+    except Exception:
+        return ""
+
+def _is_same_or_subdomain(child: str, parent: str) -> bool:
+    child = (child or "").lstrip('.').lower()
+    parent = (parent or "").lstrip('.').lower()
+    return bool(child) and bool(parent) and (child == parent or child.endswith("." + parent))
+
+# --- keyword scan with redirect hub logic ------------------------------------
+
+def _keyword_category_scan(md: str, base_domain: str) -> t.Dict[str, bool]:
     """
     Heuristic keyword flags from raw markdown to catch cases LLM may miss
-    (e.g., tokens present only in menus/anchors).
+    (e.g., tokens present only in menus/anchors). Also detects minimalist redirect hubs.
     """
-    txt = (md or "").lower()
+    txt = (md or "")
+    lower = txt.lower()
 
-    def any_re(patterns: t.List[str]) -> bool:
-        return any(re.search(p, txt, flags=re.IGNORECASE) for p in patterns)
+    def any_re(patterns: t.List[str], hay: str = lower) -> bool:
+        return any(re.search(p, hay, flags=re.IGNORECASE) for p in patterns)
 
     flags = {
         "porn_erotica": False,
@@ -236,24 +256,22 @@ def _keyword_category_scan(md: str) -> t.Dict[str, bool]:
     if any_re(alc_words):
         flags["alcohol"] = True
 
-    # --- casino/gambling
+    # --- casino/gambling (tightened)
     gamb_words = [
-      r"\bказин(?:о|а|е)\b",
-      r"\bбукмекер\w*",
-      r"\bбетт?инг\w*",
-      r"\bпокер\b",
-      r"\bлотере\w*",
-      r"\bslots?\b",
-      r"\bрулетк\w*",
-      # "ставки" only when tied to sports/gambling context
-      r"\bставк\w*\s+(?:на|в)\s+(?:спорт|матч\w*|игр\w+|киберспорт|футбол|теннис|баскетбол)",
-      # common brands/domains
-      r"\b1xbet\b|\bfonbet\b|\bparimatch\b|\bmostbet\b|\bbet365\b|\bggbet\b|\bwinline\b|\bolimp\b|\bligastavok\b",
+        r"\bказин(?:о|а|е)\b",
+        r"\bбукмекер\w*",
+        r"\bбетт?инг\w*",
+        r"\bпокер\b",
+        r"\bлотере\w*",
+        r"\bslots?\b",
+        r"\bрулетк\w*",
+        r"\bставк\w*\s+(?:на|в)\s+(?:спорт|матч\w*|игр\w+|киберспорт|футбол|теннис|баскетбол)",
+        r"\b1xbet\b|\bfonbet\b|\bparimatch\b|\bmostbet\b|\bbet365\b|\bggbet\b|\bwinline\b|\bolimp\b|\bligastavok\b",
     ]
     if any_re(gamb_words):
         flags["casino_gambling"] = True
 
-    # --- weapons (very rough)
+    # --- weapons (rough)
     weap_words = [
         r"\bоруж\w*", r"\bбоеприпас\w*", r"\bпистолет\w*",
         r"\bвинтовк\w*", r"\bтравмат\w*", r"\bнож(?!\w{0,3}\s*для\s*кух)",
@@ -261,169 +279,51 @@ def _keyword_category_scan(md: str) -> t.Dict[str, bool]:
     if any_re(weap_words):
         flags["weapons"] = True
 
-    # --- profanity (optional rough list)
+    # --- profanity (rough list)
     prof_words = [r"\bх[у*]й\b", r"\bп[и*]зд", r"\bеба\w*", r"\bбля\w*"]
     if any_re(prof_words):
         flags["profanity"] = True
 
-    # --- redirect_minimal_site heuristic (many links, little text)
-    links = len(re.findall(r"\]\(https?://", txt))
-    words = len(re.findall(r"[А-Яа-яA-Za-z0-9]{3,}", txt))
-    if links >= 40 and words / max(links, 1) < 25:
-        flags["redirect_minimal_site"] = True
+    # ---- redirect hub detection (new, precise) --------------------------------
+    # Extract [anchor](url) pairs to analyze anchor text and destinations
+    pairs = re.findall(r"\[([^\]]{0,200})\]\(([^)]+)\)", txt)
+    http_pairs = []
+    external = 0
+    internal = 0
 
-    return flags
+    base = (base_domain or "").lower()
 
-def _force_fraud_if_any_category_true(result: t.Dict[str, t.Any]) -> t.Dict[str, t.Any]:
-    """
-    NEW: if ANY boolean in content_categories == True -> enforce is_fraud = True.
-    Does not modify risk_score or other fields.
-    """
-    try:
-        cc = result.get("content_categories", {}) or {}
-        if isinstance(cc, dict) and any(bool(v) for v in cc.values()):
-            result["is_fraud"] = True
-        return result
-    except Exception:
-        return result
-
-def _replicate_create_prediction(prompt: str) -> str:
-    """Create prediction on Replicate; return prediction id."""
-    url = f"{REPLICATE_API}/models/{REPLICATE_MODEL}/predictions"
-    headers = {
-        "Authorization": f"Bearer {REPLICATE_TOKEN}",
-        "Content-Type": "application/json",
-    }
-    body = {
-        "input": {
-            "top_p": 1,
-            "prompt": prompt,
-            "max_tokens": 48024,
-            "temperature": 0.1,
-            "presence_penalty": 0,
-            "frequency_penalty": 0,
-        }
-    }
-
-    resp = requests.post(url, headers=headers, json=body, timeout=60)
-
-    # Fallback if path form is unsupported in environment (use version param style)
-    if resp.status_code == 404:
-        url = f"{REPLICATE_API}/predictions"
-        body = {"version": REPLICATE_MODEL, "input": body["input"]}
-        resp = requests.post(url, headers=headers, json=body, timeout=60)
-
-    resp.raise_for_status()
-    data = resp.json()
-    prediction_id = data.get("id")
-    if not prediction_id:
-        raise RuntimeError("No prediction ID from Replicate API")
-    return prediction_id
-
-def _replicate_poll_prediction(prediction_id: str) -> t.Any:
-    """Poll until succeeded/failed or timeout; return parsed JSON output."""
-    headers = {
-        "Authorization": f"Bearer {REPLICATE_TOKEN}",
-        "Content-Type": "application/json",
-    }
-    start = time.time()
-    timeout_sec = REPLICATE_TIMEOUT_MS / 1000.0
-
-    while (time.time() - start) < timeout_sec:
-        url = f"{REPLICATE_API}/predictions/{prediction_id}"
-        r = requests.get(url, headers=headers, timeout=30)
-        r.raise_for_status()
-        data = r.json()
-        status = data.get("status")
-
-        if status == "succeeded":
-            output = data.get("output")
-            # Replicate LLMs sometimes return array of strings → join
-            if isinstance(output, list):
-                output = "".join([s for s in output if isinstance(s, str) and s.strip()])
-            if isinstance(output, str):
-                try:
-                    return json.loads(output)
-                except Exception as e:
-                    raise RuntimeError(f"Invalid JSON in Replicate output: {e}") from e
-            elif isinstance(output, dict):
-                return output
-            else:
-                raise RuntimeError("Unexpected Replicate output type")
-        elif status in ("failed", "canceled"):
-            err = data.get("error") or "Unknown error"
-            raise RuntimeError(f"Replicate prediction {status}: {err}")
-
-        time.sleep(REPLICATE_POLL_INTERVAL_SEC)
-
-    raise TimeoutError("Timeout waiting for Replicate prediction to complete")
-
-class Predictor(BasePredictor):
-    def setup(self) -> None:
-        """No heavy model to preload."""
-        pass
-
-    def predict(
-        self,
-        url: str = Input(description="Public URL to classify (HTML page to be scraped via Firecrawl)"),
-    ) -> t.Dict[str, t.Any]:
-        """
-        Firecrawl -> markdown, Replicate classify (create + poll), parse JSON, return.
-
-        Returns:
-          {
-            "success": true/false,
-            "url": "<url>",
-            "result": <json object>  # on success
-            "error": "<message>"     # on failure
-          }
-        """
+    def _url_domain(u: str) -> str:
         try:
-            scraped = _scrape_markdown(url)
-            print(scraped)
-            if not scraped.markdown:
-                return {"success": False, "url": url, "error": "No markdown from Firecrawl"}
+            if u.startswith("http"):
+                dom = urlparse(u).netloc.split('@')[-1].split(':')[0].lower()
+                return dom.encode("idna").decode("ascii")
+            return ""
+        except Exception:
+            return ""
 
-            # keyword hints from raw markdown (anchors/menus included)
-            hints = _keyword_category_scan(scraped.markdown)
-            hint_tokens = [k for k, v in hints.items() if v]
+    # classify links
+    for label, href in pairs:
+        href_l = href.strip().lower()
+        if href_l.startswith(("tel:", "mailto:")):
+            # treat contact links as external but don't count them as "buttons" unless labeled deceptively
+            external += 1
+            continue
 
-            # (Option A) feed hints into prompt explicitly to steer LLM
-            prompt = (
-                f"{PROMPT_HEADER}\n\n"
-                f"Signals (pre-detected category flags): {json.dumps(hint_tokens, ensure_ascii=False)}\n\n"
-                f"Page markdown:\n\n{scraped.markdown}"
-            )
+        # social/app shortcuts strongly indicate external
+        if any(s in href_l for s in ("wa.me/", "t.me/", "telegram.me/", "telegram.org/", "vk.com/", "ok.ru/",
+                                     "instagram.com/", "facebook.com/", "youtube.com/", "youtu.be/", "whatsapp.com/")):
+            external += 1
+        elif href_l.startswith("http"):
+            dom = _url_domain(href_l)
+            if dom and base and not _is_same_or_subdomain(dom, base):
+                external += 1
+            else:
+                internal += 1
+        else:
+            # anchors like #popup, or relative paths → internal
+            internal += 1
 
-            prediction_id = _replicate_create_prediction(prompt)
-            parsed_json = _replicate_poll_prediction(prediction_id)
-
-            # Merge keyword flags (OR-logic with model output)
-            try:
-                cc = parsed_json.get("content_categories") or {}
-                # enforce presence of all keys, default False
-                for key in [
-                    "porn_erotica","adult_services","drugs","tobacco_nicotine","casino_gambling",
-                    "weapons","phishing","government_services_impersonation","redirect_minimal_site",
-                    "redirect_buttons","financial_scam_payouts","account_sales","profanity","alcohol"
-                ]:
-                    cc[key] = bool(cc.get(key, False) or hints.get(key, False))
-                parsed_json["content_categories"] = cc
-            except Exception:
-                pass
-
-            # Enforce is_fraud = True if ANY category is True (per your policy)
-            parsed_json = _force_fraud_if_any_category_true(parsed_json)
-
-            # Light debug
-            try:
-                print(f"[RESULT] is_fraud={parsed_json.get('is_fraud')} "
-                      f"risk={parsed_json.get('risk_score')} "
-                      f"lang={parsed_json.get('language')}")
-            except Exception:
-                pass
-
-            return {"success": True, "url": url, "result": parsed_json}
-
-        except Exception as e:
-            return {"success": False, "url": url, "error": str(e)}
+        # redirect_buttons: only if the link goes external AND text looks like a generic CTA
+        button_like = any_re([
+            r"\bскачать\b", r"\bdow
