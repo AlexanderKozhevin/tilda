@@ -151,7 +151,7 @@ class ScrapeResult:
 def _scrape_markdown(url: str) -> ScrapeResult:
     """Firecrawl v2 scrape -> markdown (same fallbacks as in Node)."""
     endpoint = f"{FIRECRAWL_BASE}/v2/scrape"
-    payload = {"url": url, "formats": ["markdown"], onlyMainContent: false}
+    payload = {"url": url, "formats": ["markdown"], "onlyMainContent": false}
     headers = {"Content-Type": "application/json"}
 
     r = requests.post(endpoint, headers=headers, json=payload, timeout=90)
