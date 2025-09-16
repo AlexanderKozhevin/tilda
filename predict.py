@@ -170,6 +170,19 @@ def _scrape_markdown(url: str) -> ScrapeResult:
 
     return ScrapeResult(markdown=md, length=len(md))
 
+def _force_fraud_if_any_category_true(result: t.Dict[str, t.Any]) -> t.Dict[str, t.Any]:
+    """
+    If any boolean in content_categories == True -> enforce is_fraud = True.
+    Does not modify risk_score or other fields.
+    """
+    try:
+        cc = result.get("content_categories", {})
+        if isinstance(cc, dict) and any(bool(v) for v in cc.values()):
+            result["is_fraud"] = True
+        return result
+    except Exception:
+        return result
+
 def _replicate_create_prediction(prompt: str) -> str:
     """Create prediction on Replicate; return prediction id."""
     url = f"{REPLICATE_API}/models/{REPLICATE_MODEL}/predictions"
@@ -271,6 +284,7 @@ class Predictor(BasePredictor):
 
             prediction_id = _replicate_create_prediction(prompt)
             parsed_json = _replicate_poll_prediction(prediction_id)
+            parsed_json = _force_fraud_if_any_category_true(parsed_json)
 
             # Light debug
             try:
