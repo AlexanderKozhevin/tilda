@@ -238,8 +238,17 @@ def _keyword_category_scan(md: str) -> t.Dict[str, bool]:
 
     # --- casino/gambling
     gamb_words = [
-        r"\bказин\w*", r"\bбукмеке\w*", r"\bставк\w*", r"\bпокер\b",
-        r"\bлотере\w*", r"\bbetting\b", r"\bslots?\b",
+      r"\bказин(?:о|а|е)\b",
+      r"\bбукмекер\w*",
+      r"\bбетт?инг\w*",
+      r"\bпокер\b",
+      r"\bлотере\w*",
+      r"\bslots?\b",
+      r"\bрулетк\w*",
+      # "ставки" only when tied to sports/gambling context
+      r"\bставк\w*\s+(?:на|в)\s+(?:спорт|матч\w*|игр\w+|киберспорт|футбол|теннис|баскетбол)",
+      # common brands/domains
+      r"\b1xbet\b|\bfonbet\b|\bparimatch\b|\bmostbet\b|\bbet365\b|\bggbet\b|\bwinline\b|\bolimp\b|\bligastavok\b",
     ]
     if any_re(gamb_words):
         flags["casino_gambling"] = True
