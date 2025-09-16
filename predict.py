@@ -289,7 +289,7 @@ def _replicate_create_prediction(prompt: str) -> str:
         "input": {
             "top_p": 1,
             "prompt": prompt,
-            "max_tokens": 8024,
+            "max_tokens": 48024,
             "temperature": 0.1,
             "presence_penalty": 0,
             "frequency_penalty": 0,
