@@ -6,6 +6,7 @@ import json
 import time
 import typing as t
 import requests
+import re
 from dataclasses import dataclass
 
 from cog import BasePredictor, Input
@@ -96,6 +97,7 @@ PROMPT_HEADER = f"""You are a web security & trust & safety analyst.
 Rules (very strict):
 1) Output ONLY valid **minified JSON** matching the provided schema. No prose, markdown, comments, or extra keys.
 2) Use ONLY on-page content (the scraped markdown below). Do NOT imagine images. Treat alt-text, filenames, captions, anchors, and button labels as text evidence. Do NOT follow links.
+2a) Меню, названия разделов и кнопок, хлебные крошки и анкоры считать полноправной уликой. Если встречаются "мухомор", "Amanita muscaria", "fly agaric", "пантерный мухомор" — это сигналы категории drugs=true.
 3) Detect the original page language (ISO 639-1, optional region). Write both "summary" and "keywords" in Russian language only!
 4) Fill "hosting":
    - "domain": the primary domain you can infer from links/markdown context; if unknown, use an empty string "".
@@ -118,13 +120,12 @@ Rules (very strict):
    - alcohol: алкоголь/доставка спиртного.
 
 6) Heuristics & exceptions:
-   - Наличие только adult/drugs/tobacco_nicotine/profanity/alcohol само по себе не означает fraud — отмечай категории, но «is_fraud» ставь лишь при обмане/имперсонации/ловушках оплаты.
-   - Если встречаются термины табака/никотина (жевательный табак/снюс/oral nicotine/nicotine pouch/vape/e-cig/IQOS/heat-not-burn/кальян/табак/сигареты/сигары) — ставь tobacco_nicotine=true.
+   - Наличие adult/drugs/tobacco_nicotine/profanity/alcohol отмечай в категориях. Это может быть нежелательный контент, но сам по себе не равен мошенничеству.
    - «Хаб-редирект»: если страница крайне короткая и почти целиком из кнопок/якорей на сторонние сайты — ставь redirect_minimal_site=true; если формулировки кнопок обманные — также redirect_buttons=true.
-   - government/brand impersonation → phishing или government_services_impersonation и likely is_fraud=true.
+   - government/brand impersonation → phishing или government_services_impersonation.
 
 7) Fraud rubric:
-   - "is_fraud": true если страница пытается обмануть или украсть данные/деньги (phishing, impersonation, payout scams, deceptive redirects).
+   - "is_fraud": оставь как поле; будет выставлено системой после объединения сигналов. Модель может давать свою оценку, но финальное значение задаст пост-обработка.
    - "risk_score":
        ≥0.90 явное мошенничество/phishing/имперсонация с формами ввода, seed/wallet и пр.
        0.70–0.89 сильные признаки нарушений (прямые продажи наркотиков, явные услуги проституции, экстремизм, торговля оружием, казино с платежными воронками, обманные редирект-хабы).
@@ -170,13 +171,107 @@ def _scrape_markdown(url: str) -> ScrapeResult:
 
     return ScrapeResult(markdown=md, length=len(md))
 
+def _keyword_category_scan(md: str) -> t.Dict[str, bool]:
+    """
+    Heuristic keyword flags from raw markdown to catch cases LLM may miss
+    (e.g., tokens present only in menus/anchors).
+    """
+    txt = (md or "").lower()
+
+    def any_re(patterns: t.List[str]) -> bool:
+        return any(re.search(p, txt, flags=re.IGNORECASE) for p in patterns)
+
+    flags = {
+        "porn_erotica": False,
+        "adult_services": False,
+        "drugs": False,
+        "tobacco_nicotine": False,
+        "casino_gambling": False,
+        "weapons": False,
+        "phishing": False,
+        "government_services_impersonation": False,
+        "redirect_minimal_site": False,
+        "redirect_buttons": False,
+        "financial_scam_payouts": False,
+        "account_sales": False,
+        "profanity": False,
+        "alcohol": False,
+    }
+
+    # --- drugs: includes amanita/mushroom context
+    drugs_words = [
+        r"\bмухомор\w*",
+        r"\bпантерн\w*\s*мухомор\w*",
+        r"\bamanita\b",
+        r"\bamanita\s+muscaria\b",
+        r"\bfly\s+agaric\b",
+        r"\bканнабис\b",
+        r"\bмарихуан\w*",
+        r"\bcbd\b",
+        r"\bкбд\b",
+        r"\bthc\b",
+        r"\bдельта[-\s]*8\b",
+        r"\bзакись\s+азота\b",
+        r"\bпсилоциб\w*",
+    ]
+    if any_re(drugs_words):
+        flags["drugs"] = True
+
+    # --- tobacco/nicotine
+    tob_words = [
+        r"\bтабак\w*", r"\bкальян\w*", r"\bвейп\w*",
+        r"\bэлектронн\w*\s*сигарет\w*", r"\biqos\b",
+        r"\bheat[-\s]?not[-\s]?burn\b", r"\bснюс\w*",
+        r"\bnicotine\s+pouch(?:es)?\b", r"\bникотин\w*",
+        r"\boral\s+nicotine\b",
+    ]
+    if any_re(tob_words):
+        flags["tobacco_nicotine"] = True
+
+    # --- alcohol
+    alc_words = [
+        r"\bалкогол\w*", r"\bпиво\w*", r"\bвино\w*", r"\bводк\w*",
+        r"\bвиски\b", r"\bконьяк\b", r"\bром\b", r"\bсидр\b", r"\bшампанск\w*",
+    ]
+    if any_re(alc_words):
+        flags["alcohol"] = True
+
+    # --- casino/gambling
+    gamb_words = [
+        r"\bказин\w*", r"\bбукмеке\w*", r"\bставк\w*", r"\bпокер\b",
+        r"\bлотере\w*", r"\bbetting\b", r"\bslots?\b",
+    ]
+    if any_re(gamb_words):
+        flags["casino_gambling"] = True
+
+    # --- weapons (very rough)
+    weap_words = [
+        r"\bоруж\w*", r"\bбоеприпас\w*", r"\bпистолет\w*",
+        r"\bвинтовк\w*", r"\bтравмат\w*", r"\bнож(?!\w{0,3}\s*для\s*кух)",
+    ]
+    if any_re(weap_words):
+        flags["weapons"] = True
+
+    # --- profanity (optional rough list)
+    prof_words = [r"\bх[у*]й\b", r"\bп[и*]зд", r"\bеба\w*", r"\bбля\w*"]
+    if any_re(prof_words):
+        flags["profanity"] = True
+
+    # --- redirect_minimal_site heuristic (many links, little text)
+    links = len(re.findall(r"\]\(https?://", txt))
+    words = len(re.findall(r"[А-Яа-яA-Za-z0-9]{3,}", txt))
+    if links >= 40 and words / max(links, 1) < 25:
+        flags["redirect_minimal_site"] = True
+
+    return flags
+
 def _force_fraud_if_any_category_true(result: t.Dict[str, t.Any]) -> t.Dict[str, t.Any]:
     """
-    If any boolean in content_categories == True -> enforce is_fraud = True.
+    NEW: if ANY boolean in content_categories == True -> enforce is_fraud = True.
     Does not modify risk_score or other fields.
     """
     try:
-        cc = result.get("content_categories", {})
+        cc = result.get("content_categories", {}) or {}
         if isinstance(cc, dict) and any(bool(v) for v in cc.values()):
             result["is_fraud"] = True
         return result
@@ -280,10 +375,35 @@ class Predictor(BasePredictor):
             if not scraped.markdown:
                 return {"success": False, "url": url, "error": "No markdown from Firecrawl"}
 
-            prompt = f"{PROMPT_HEADER}\n\nPage markdown:\n\n{scraped.markdown}"
+            # keyword hints from raw markdown (anchors/menus included)
+            hints = _keyword_category_scan(scraped.markdown)
+            hint_tokens = [k for k, v in hints.items() if v]
+
+            # (Option A) feed hints into prompt explicitly to steer LLM
+            prompt = (
+                f"{PROMPT_HEADER}\n\n"
+                f"Signals (pre-detected category flags): {json.dumps(hint_tokens, ensure_ascii=False)}\n\n"
+                f"Page markdown:\n\n{scraped.markdown}"
+            )
 
             prediction_id = _replicate_create_prediction(prompt)
             parsed_json = _replicate_poll_prediction(prediction_id)
+
+            # Merge keyword flags (OR-logic with model output)
+            try:
+                cc = parsed_json.get("content_categories") or {}
+                # enforce presence of all keys, default False
+                for key in [
+                    "porn_erotica","adult_services","drugs","tobacco_nicotine","casino_gambling",
+                    "weapons","phishing","government_services_impersonation","redirect_minimal_site",
+                    "redirect_buttons","financial_scam_payouts","account_sales","profanity","alcohol"
+                ]:
+                    cc[key] = bool(cc.get(key, False) or hints.get(key, False))
+                parsed_json["content_categories"] = cc
+            except Exception:
+                pass
+
+            # Enforce is_fraud = True if ANY category is True (per your policy)
             parsed_json = _force_fraud_if_any_category_true(parsed_json)
 
             # Light debug
